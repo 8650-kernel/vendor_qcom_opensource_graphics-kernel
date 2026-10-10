@@ -11,8 +11,8 @@ ifeq ($(ENABLE_HYP), true)
         KGSL_ENABLED := false
 endif
 
-LOCAL_MODULE_DDK_BUILD := true
-LOCAL_MODULE_DDK_ALLOW_UNSAFE_HEADERS := true
+#LOCAL_MODULE_DDK_BUILD := true
+#LOCAL_MODULE_DDK_ALLOW_UNSAFE_HEADERS := true
 
 ifeq ($(KGSL_ENABLED),true)
 KGSL_SELECT := CONFIG_QCOM_KGSL=m
@@ -52,6 +52,8 @@ endif
 # Include msm_kgsl.ko in the /vendor/lib/modules (vendor.img)
 BOARD_VENDOR_KERNEL_MODULES += $(LOCAL_MODULE_PATH)/$(LOCAL_MODULE)
 include $(DLKM_DIR)/Build_external_kernelmodule.mk
+
+include $(LOCAL_PATH)/oplus_sync_fence/Android.mk
 
 endif # DLKM check
 endif # KGSL_ENABLED
