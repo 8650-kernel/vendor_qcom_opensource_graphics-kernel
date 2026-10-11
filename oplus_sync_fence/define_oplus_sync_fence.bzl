@@ -11,6 +11,7 @@ def _define_module(target, variant):
         srcs = ["src/oplus_sync_file.c"],
         deps = [
             "//msm-kernel:all_headers",
+            "//msm-kernel:all_headers_oplus",
         ],
         out = "oplus_sync_fence.ko",
         kconfig = "Kconfig",
