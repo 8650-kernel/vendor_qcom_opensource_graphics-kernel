@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2020-2021, The Linux Foundation. All rights reserved.
- * Copyright (c) 2022-2024, Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 
 #include <linux/dma-fence-array.h>
@@ -14,6 +14,7 @@
 #include "adreno_trace.h"
 #include "kgsl_timeline.h"
 #include <linux/msm_kgsl.h>
+
 
 /*
  * Number of commands that can be queued in a context before it sleeps
@@ -429,6 +430,8 @@ static int hwsched_sendcmd(struct adreno_device *adreno_dev,
 	struct kgsl_context *context = drawobj->context;
 	int ret;
 	struct cmd_list_obj *obj;
+	int is_current_rt = rt_task(current);
+	int nice = task_nice(current);
 
 	obj = kmem_cache_alloc(obj_cache, GFP_KERNEL);
 	if (!obj)
@@ -436,17 +439,19 @@ static int hwsched_sendcmd(struct adreno_device *adreno_dev,
 
 	mutex_lock(&device->mutex);
 
+	/* Elevating thread's priority to avoid context switch with holding device mutex */
+	if (!is_current_rt)
+		sched_set_fifo(current);
+
 	if (_abort_submission(adreno_dev)) {
-		mutex_unlock(&device->mutex);
-		kmem_cache_free(obj_cache, obj);
-		return -EBUSY;
+		ret = -EBUSY;
+		goto done;
 	}
 
 
 	if (kgsl_context_detached(context)) {
-		mutex_unlock(&device->mutex);
-		kmem_cache_free(obj_cache, obj);
-		return -ENOENT;
+		ret = -ENOENT;
+		goto done;
 	}
 
 	hwsched->inflight++;
@@ -456,9 +461,7 @@ static int hwsched_sendcmd(struct adreno_device *adreno_dev,
 		ret = adreno_active_count_get(adreno_dev);
 		if (ret) {
 			hwsched->inflight--;
-			mutex_unlock(&device->mutex);
-			kmem_cache_free(obj_cache, obj);
-			return ret;
+			goto done;
 		}
 		set_bit(ADRENO_HWSCHED_POWER, &hwsched->flags);
 	}
@@ -475,9 +478,7 @@ static int hwsched_sendcmd(struct adreno_device *adreno_dev,
 		}
 
 		hwsched->inflight--;
-		kmem_cache_free(obj_cache, obj);
-		mutex_unlock(&device->mutex);
-		return ret;
+		goto done;
 	}
 
 	if ((hwsched->inflight == 1) &&
@@ -504,9 +505,13 @@ static int hwsched_sendcmd(struct adreno_device *adreno_dev,
 	list_add_tail(&obj->node, &hwsched->cmd_list);
 
 done:
+	if (!is_current_rt)
+		sched_set_normal(current, nice);
 	mutex_unlock(&device->mutex);
+	if (ret)
+		kmem_cache_free(obj_cache, obj);
 
-	return 0;
+	return ret;
 }
 
 /**
@@ -712,50 +717,6 @@ u32 adreno_hwsched_gpu_fault(struct adreno_device *adreno_dev)
 	/* make sure we're reading the latest value */
 	smp_rmb();
 	return atomic_read(&adreno_dev->hwsched.fault);
-}
-
-/**
- * adreno_hwsched_issuecmds() - Issue commmands from pending contexts
- * @adreno_dev: Pointer to the adreno device struct
- *
- * Lock the dispatcher and call hwsched_issuecmds
- */
-static void adreno_hwsched_issuecmds(struct adreno_device *adreno_dev)
-{
-	struct adreno_hwsched *hwsched = &adreno_dev->hwsched;
-	struct kgsl_device *device = KGSL_DEVICE(adreno_dev);
-
-	spin_lock(&device->submit_lock);
-	/* If GPU state is not ACTIVE, schedule the work for later */
-	if (device->skip_inline_submit) {
-		spin_unlock(&device->submit_lock);
-		goto done;
-	}
-	device->submit_now++;
-	spin_unlock(&device->submit_lock);
-
-	/* If the dispatcher is busy then schedule the work for later */
-	if (!mutex_trylock(&hwsched->mutex)) {
-		_decrement_submit_now(device);
-		goto done;
-	}
-
-	if (!adreno_hwsched_gpu_fault(adreno_dev))
-		hwsched_issuecmds(adreno_dev);
-
-	if (hwsched->inflight > 0) {
-		mutex_lock(&device->mutex);
-		kgsl_pwrscale_update(device);
-		kgsl_start_idle_timer(device);
-		mutex_unlock(&device->mutex);
-	}
-
-	mutex_unlock(&hwsched->mutex);
-	_decrement_submit_now(device);
-	return;
-
-done:
-	adreno_hwsched_trigger(adreno_dev);
 }
 
 /**
@@ -1105,7 +1066,7 @@ static int adreno_hwsched_queue_cmds(struct kgsl_device_private *dev_priv,
 	if (_kgsl_context_get(&drawctxt->base)) {
 		trace_dispatch_queue_context(drawctxt);
 		llist_add(&job->node, &hwsched->jobs[drawctxt->base.priority]);
-		adreno_hwsched_issuecmds(adreno_dev);
+		adreno_hwsched_trigger(adreno_dev);
 
 	} else
 		kmem_cache_free(jobs_cache, job);
@@ -1894,6 +1855,10 @@ static bool adreno_hwsched_do_fault(struct adreno_device *adreno_dev)
 
 	mutex_lock(&device->mutex);
 
+#ifdef CONFIG_OPLUS_GPU_MINIDUMP
+	device->snapshotfault = fault;
+#endif /*CONFIG_OPLUS_GPU_MINIDUMP*/
+
 	if (test_bit(ADRENO_HWSCHED_CTX_BAD_LEGACY, &hwsched->flags))
 		adreno_hwsched_reset_and_snapshot_legacy(adreno_dev, fault);
 	else
@@ -2452,10 +2417,10 @@ static void adreno_hwsched_lookup_key_value(struct adreno_device *adreno_dev,
 		if ((payload->type == type) && (payload->data[i] == key)) {
 			u32 j = 1;
 
-			do {
+			while (num_values--) {
 				ptr[j - 1] = payload->data[i + j];
 				j++;
-			} while (num_values--);
+			}
 			break;
 		}
 
